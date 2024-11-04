@@ -1,11 +1,40 @@
+
+# Utilities - data_utils.py
+
 # import the necessary libraries
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split
 from sklearn.model_selection import train_test_split
+
 from collections import defaultdict
 from pdb import set_trace as bp
+
+# Uncomment out below lines if using Colab
+# # Check if CUDA is available
+# if torch.cuda.is_available():
+#     # Get the name of the current GPU
+#     gpu_name = torch.cuda.get_device_name(torch.cuda.current_device())
+
+#     # Print the GPU name
+#     print(f"Using GPU: {gpu_name}")
+
+#     # Check if the GPU is one that supports Tensor Cores
+#     if 'L4' in gpu_name or 'V100' in gpu_name or 'A100' in gpu_name:
+#         # Set precision to high or medium for Tensor Cores optimization
+#         precision_optmization='high'
+#         torch.set_float32_matmul_precision(precision_optmization)
+#         print(f"Setting torch.set_float32_matmul_precision to {precision_optmization} for Tensor Core optimization.")
+#     else:
+#         print("No Tensor Cores detected, no precision change applied.")
+# else:
+#     print("No CUDA device found, using CPU.")
+
+# Flushing very small floating-point numbers is a recommended practice to improve the performance
+# of neural network models. Flushing denormal numbers to zero, can prevent CPU computational slowdowns
+# on certain hardware, especially for small-scale values in gradient updates or during optimization.
+torch.set_flush_denormal(True)
 
 class CustomDataset(Dataset):
     def __init__(self, data, binary_cols):
@@ -28,9 +57,9 @@ class CustomDataset(Dataset):
         self.binary_mask = (~np.isnan(binary_data)).astype(float)  # Mask of available data (1 where data is present, 0 where it's NaN)
         self.real_mask = (~np.isnan(real_data)).astype(float)  # Mask of available data (1 where data is present, 0 where it's NaN)
 
-        self.binary_data = np.nan_to_num(binary_data, nan=0.5)  # Replace NaNs with -1, after the mask is created
-        self.real_data = np.nan_to_num(real_data, nan=0.5)  # Replace NaNs with -1, after the mask is created
-        
+        self.binary_data = np.nan_to_num(binary_data, nan=0.5)  # Replace NaNs with 0.5, after the mask is created
+        self.real_data = np.nan_to_num(real_data, nan=0.5)  # Replace NaNs with 0.5, after the mask is created
+
         # print the overall shape of the data
         print("BINARY data report...")
         print(f"Data shape: {self.binary_data.shape}")
@@ -106,6 +135,7 @@ class CustomMinMaxScalerWithGroups:
             self.feature_groups_indices = [
                 [self.columns_.index(col) for col in group] for group in self.feature_groups
             ]
+
             X = X.values  # Convert to NumPy array for processing
 
         # Convert to float for log scaling
@@ -134,8 +164,10 @@ class CustomMinMaxScalerWithGroups:
         # Convert to float for log scaling
         X = X.astype(float)
 
+        # Assuming m_age is a known column name or index
         for i, group_indices in enumerate(self.feature_groups_indices):
             group_data = np.log10(1 + X[:, group_indices]) #apply a log10(1+x) transformation
+
             group_min = self.group_mins[i]
             group_max = self.group_maxs[i]
 
@@ -193,9 +225,14 @@ class CustomMinMaxScalerWithGroups:
 # 3. Data preprocessing and split
 def prepare_data(filename="data/combined_data_subset_1_percent",
                  batch_size=None,
-                 shuffle_train=True):
+                 shuffle_train=True,
+                 test_dataset_predictions=False,
+                 test_dataset_raw_dir=None,
+                 input_type="input_all_rows"):
 
     data = pd.read_csv(filename, low_memory=False)
+
+    all_columns = data.columns
 
     # Keep track of "suid" and "eir" columns in order to add them back to the predictions
     eir_suid = data[['eir', 'suid']]
@@ -204,7 +241,7 @@ def prepare_data(filename="data/combined_data_subset_1_percent",
     data = data.drop(columns=["suid", "eir"])
 
     # Keep track of all the columns and their ordering in order to return the predictions in the same order
-    original_columns = data.columns 
+    original_columns = data.columns
 
     # plot_missingness(data)
 
@@ -213,6 +250,9 @@ def prepare_data(filename="data/combined_data_subset_1_percent",
 
     # Keep track of all degenerate columns and their singular values in order to add them back to the predictions
     degenerate_cols = {col: data[col].dropna().unique()[0] if not data[col].dropna().empty else np.nan for col in single_value_cols}
+
+    # Storing values of all degenerate columns
+    degenerate_data = data[single_value_cols]
 
     # print all droppable columns even if it is a long list
     print("Droppable columns that are degenerate")
@@ -229,9 +269,6 @@ def prepare_data(filename="data/combined_data_subset_1_percent",
     # Use the split indices to create train and test datasets for both data and eir_suid
     train_data = data.loc[train_idx]
     test_data = data.loc[test_idx]
-    
-    # Align suid/eir to the same train/test split so that the correct mapping is maintained when suid/eir is added back to predictions
-    test_eir_suid = eir_suid.loc[test_idx]
 
     # First get a list of all boolean columns by checking if all values are 0 or 1
     boolean_cols = [
@@ -333,7 +370,7 @@ def prepare_data(filename="data/combined_data_subset_1_percent",
 
     infection_list = [1, 2, 3]
     for nm in infection_fill_names:
-        grouped_cols[nm] = [f"infection_{i}_{nm}" for i in infection_list] 
+        grouped_cols[nm] = [f"infection_{i}_{nm}" for i in infection_list]
 
     for nm in double_names:
         grouped_cols[nm] = [
@@ -365,9 +402,11 @@ def prepare_data(filename="data/combined_data_subset_1_percent",
     # build a single list of all columns that are grouped (i.e. unroll the dictionary)
     grouped_cols_list = [col for cols in grouped_cols.values() for col in cols]
 
+    filtered_cols = data.columns # Columns of the original dataset before scaling.
+
     # now loop over all columns in the actual dataset.
     # if they are not in the grouped columns, then add them as their own group
-    i = 1 #Can this be removed
+    #i = 1 #Can this be removed
     for col in data.columns:
         if col not in grouped_cols_list:
             if col not in grouped_cols.keys():
@@ -376,7 +415,7 @@ def prepare_data(filename="data/combined_data_subset_1_percent",
                 # Key collision detected. Key is also a column, so append it to value
                 print(f"Adding to {col} already present as a key in grouped_cols with values: {grouped_cols[col]}")
                 grouped_cols[col].append(col)
-            i += 1 #Can this be removed
+            #i += 1 #Can this be removed
 
     print(f"We have distilled the dataset into {len(grouped_cols)} groups of columns.")
     print(
@@ -390,9 +429,6 @@ def prepare_data(filename="data/combined_data_subset_1_percent",
     )
     train_data_scaled = scaler.fit_transform(train_data, return_df=True)
     test_data_scaled = scaler.transform(test_data, return_df=True)
-
-
-    # find_problematic_columns(train_data_scaled, test_data_scaled)
 
     # Create Datasets without indices, working with NumPy arrays
     # re-build the grouped_cols_list
@@ -413,8 +449,20 @@ def prepare_data(filename="data/combined_data_subset_1_percent",
         test_data_scaled, binary_cols=columns_by_type["binary"]
     )
 
+
+    # Original
+    # # Split train data into train and validation: # 80% train, 20% validation
+    # train_dataset, val_dataset = random_split(train_dataset_pre_split, [0.8, 0.2])
+
     # Split train data into train and validation: # 80% train, 20% validation
-    train_dataset, val_dataset = random_split(train_dataset_pre_split, [0.8, 0.2])
+    # Set a fixed random seed for reproducibility
+    seed = 42  # Choose any integer seed value
+
+    # Create a torch generator with the seed
+    generator = torch.Generator().manual_seed(seed)
+
+    # Use the generator in random_split
+    train_dataset, val_dataset = random_split(train_dataset_pre_split, [0.8, 0.2], generator=generator)
 
     if batch_size is None:
         train_batch_size = len(train_dataset)
@@ -428,20 +476,45 @@ def prepare_data(filename="data/combined_data_subset_1_percent",
 
     print(f"Using batch size of {train_batch_size} for training, {val_batch_size} for validation, and {test_batch_size} for testing.")
 
-    # no reason to shuffle the data if we are using the full batch size
-    train_loader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=shuffle_train)
-    val_loader = DataLoader(val_dataset, batch_size=val_batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=test_batch_size, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=shuffle_train, num_workers=7)
+    val_loader = DataLoader(val_dataset, batch_size=val_batch_size, shuffle=False, num_workers=7)
+    test_loader = DataLoader(test_dataset, batch_size=test_batch_size, shuffle=False, num_workers=7)
 
-    # This dictionary will help recreate the final predictions which should have all input columns present and the columns must be 
-    # in the same order as the input columns
+    test_eir_suid = pd.DataFrame()
+    full_loader = None
+    if test_dataset_predictions:
+        # Only need predictions of test data
+        # We need to save the raw_test_data csv file to perform analysis on the test predictions
+
+        # Add the eir and suid columns and degenerate columns to the test data
+        test_eir_suid = eir_suid.loc[test_idx]
+        test_data_with_eir_suid = pd.concat([test_data, test_eir_suid], axis=1)
+        test_data_with_degenerate_cols = pd.concat([test_data_with_eir_suid, degenerate_data.loc[test_idx]], axis=1)
+        test_data_with_degenerate_cols = test_data_with_degenerate_cols[all_columns]
+
+        # Save the raw test data to csv file for perfoming analysis on test predictions later
+        raw_test_data_filename =  f"{test_dataset_raw_dir}/raw_test_data_{input_type}.csv"
+        print(f"Saving raw test data to {raw_test_data_filename}")
+        test_data_with_degenerate_cols.to_csv(raw_test_data_filename, index=False)
+    else:
+
+        # Predictions of full dataset has to be returned. Currently needed by Rick Final
+        full_data = data #Cannot copy data as we run out of memory
+        full_data_scaled = scaler.transform(full_data, return_df=True)  # Transform entire dataset
+        full_dataset = CustomDataset(full_data_scaled, binary_cols=columns_by_type["binary"])  # Create CustomDataset instance
+        full_loader = DataLoader(full_dataset, batch_size=batch_size, shuffle=False, num_workers=7)  # Create DataLoader instance
+
+    # This dictionary will help recreate the final predictions to have all columns as the in the raw data and in the same order
     col_list_dict = {"degenerate_cols": degenerate_cols,
                      "binary_cols": test_dataset.binary_cols,
                      "real_cols": test_dataset.real_cols,
-                     "grouped_cols": all_cols, #grouped_cols_list
-                     "original_cols": original_columns}
+                     "filtered_cols": filtered_cols,
+                     "original_cols": original_columns,
+                     "integer_encoded_binary_cols": ['m_gender']
+                     }
 
-    return train_loader, val_loader, test_loader, scaler, col_list_dict, test_eir_suid
+     #Added full_loader for Rick final
+    return train_loader, val_loader, test_loader, scaler, col_list_dict, test_eir_suid, full_loader, eir_suid
 
 
 def find_problematic_columns(train_data, test_data, relative_threshold=2, absolute_threshold=1000):
@@ -492,25 +565,24 @@ def find_problematic_columns(train_data, test_data, relative_threshold=2, absolu
         print("No problematic columns found.")
 
 
-def reverse_normalization(reconstructed_binary, reconstructed_real, scaler):
+def reverse_normalization(reconstructed_binary, reconstructed_real, scaler, col_list_dict):
     """
     Use the scaler's inverse_transform method to reverse the normalization.
     """
     # Combine the binary and real data and inverse transform them
-    combined_data = np.concatenate([reconstructed_binary, reconstructed_real], axis=1)
+    combined_data = np.concatenate([reconstructed_binary.cpu().numpy(), reconstructed_real.cpu().numpy()], axis=1)
+
+    combined_data_cols = col_list_dict["binary_cols"] + col_list_dict["real_cols"]
+    combined_data_df = pd.DataFrame(combined_data)
+    combined_data_df.columns = combined_data_cols
+
+    denormalized_data_array = combined_data_df.reindex(columns=col_list_dict["filtered_cols"]).to_numpy()
 
     # Create an empty array to store the denormalized data
-    denormalized_data = np.zeros_like(combined_data)
-    
-    # Use the scaler's inverse_transform to bring back the original scale
-    denormalized_data = scaler.inverse_transform(combined_data)
+    denormalized_data = np.zeros_like(denormalized_data_array)
 
-    if __debug__:
-        # TESTING: Print the values of dependent column 'infection_1_m_IRBCtimer' after inverse transformation
-        # to make sure the log transformation was done properly
-        if hasattr(scaler, 'columns_') and 'infection_1_m_IRBCtimer' in scaler.columns_:
-            infection_col_idx = scaler.columns_.index('infection_1_m_IRBCtimer')
-            print(f"TESTING: Values for 'infection_1_m_IRBCtimer' after returning from inverse_transform:\n{denormalized_data[:, infection_col_idx]}")
+    # Use the scaler's inverse_transform to bring back the original scale
+    denormalized_data = scaler.inverse_transform(denormalized_data_array)
 
     return denormalized_data
 
@@ -522,19 +594,16 @@ def insert_degenerate_columns(denormalized_data, col_list_dict, scaler):
 
     if hasattr(scaler, 'columns_'):
         column_names = scaler.columns_
-        
+
         # Convert combined_predictions into a DataFrame with the original column names
         denormalized_df = pd.DataFrame(denormalized_data, columns=column_names)
-
-    #TESTING
-    denormalized_df.to_csv('pre_degenerate_predictions.csv', columns=denormalized_df.columns, index=False)
 
     # Create a DataFrame from the degenerate columns
     degenerate_cols_df = pd.DataFrame(col_list_dict["degenerate_cols"], index=denormalized_df.index)
 
     # Concatenate the degenerate columns with the denormalized DataFrame
     denormalized_df = pd.concat([denormalized_df, degenerate_cols_df], axis=1)
-    
+
     # Reorder the columns to match the original dataset's column order
     denormalized_df = denormalized_df.reindex(columns=col_list_dict["original_cols"])
 
@@ -542,7 +611,7 @@ def insert_degenerate_columns(denormalized_data, col_list_dict, scaler):
 
 def create_and_populate_dependency_dict(masked_dict, all_columns):
     """
-    Creates keys for the independent columns and populates masked_dict with 
+    Creates keys for the independent columns and populates masked_dict with
     dependent columns (antibody/infection present columns and their corresponding
     capacity/concentration columns).
     """
@@ -553,12 +622,12 @@ def create_and_populate_dependency_dict(masked_dict, all_columns):
         'm_PfEMP1_minor_antibodies': 385,
         'm_PfEMP1_major_antibodies': 1070
     }
-    
+
     for antibody_type, count in antibody_types.items():
         for i in range(count):
             key = f'{antibody_type}_{i}_present' #add key
             masked_dict[key].extend([
-                f'{antibody_type}_{i}_m_antibody_capacity', 
+                f'{antibody_type}_{i}_m_antibody_capacity',
                 f'{antibody_type}_{i}_m_antibody_concentration'
             ])
 
@@ -574,16 +643,15 @@ def create_and_populate_dependency_dict(masked_dict, all_columns):
 
 def print_nan_stats(masked_predictions_df, col_list_dict):
     """
-    Computes various statistics on the data after filtering out degenerate columns. 
-    It calculates the shape, total number of NaN values, fraction of NaN values, 
+    Computes various statistics on the data after filtering out degenerate columns.
+    It calculates the shape, total number of NaN values, fraction of NaN values,
     number of columns and rows with NaNs, and the percentage of columns and rows with NaNs.
 
     """
-    
-    #masked_predictions_df = pd.DataFrame(masked_predictions, columns=col_list_dict["original_cols"])
+
     filtered_predictions_df = masked_predictions_df.drop(columns=col_list_dict["degenerate_cols"])
     filtered_predictions = filtered_predictions_df.to_numpy()
-    
+
     shape_of_filtered_predictions = filtered_predictions.shape
     num_nans = np.isnan(filtered_predictions.astype(float)).sum()
     num_columns_with_nan = np.isnan(filtered_predictions.astype(float)).any(axis=0).sum()
@@ -606,47 +674,33 @@ def threshold_binary_columns(col_list_dict, reconstructed_df):
     """
     Apply thresholding to binary columns specified in col_list_dict["binary_cols"].
     Binary columns will be thresholded such that values >= 0.5 are set to True, and others to False.
-    
-    Parameters:
-    col_list_dict (dict): Dictionary containing lists of column names, specifically "binary_cols".
-    reconstructed_df (pd.DataFrame): DataFrame containing denormalized values, including binary and real columns.
-    
-    Returns:
-    reconstructed_df (pd.DataFrame): The input dataframe is modified in place with thresholded binary columns.
     """
     binary_cols = col_list_dict.get("binary_cols", [])
-    
+    #filtered_cols = col_list_dict.get("filtered_cols", [])
+    integer_encoded_binary_cols = col_list_dict.get("integer_encoded_binary_cols", [])
+
     if not binary_cols:
         print("No binary columns found in col_list_dict['binary_cols'].")
         return
-    
-    # Apply thresholding to binary columns in place
-    reconstructed_df[binary_cols] = (reconstructed_df[binary_cols] >= 0.5).astype(bool)
-    
-    if __debug__:
-        print(f"Thresholded binary columns:\n{reconstructed_df[binary_cols].head()}")
-    
+
+    # Determine binary columns that are not in filtered_cols
+    #binary_cols_to_threshold = [col for col in binary_cols if col not in filtered_cols]
+    binary_cols_to_threshold = [col for col in binary_cols if col not in integer_encoded_binary_cols]
+
+    # Apply thresholding (>= 0.5) to all binary columns (set values to 1 or 0)
+    reconstructed_df[binary_cols] = (reconstructed_df[binary_cols] >= 0.5).astype(int)
+
+    reconstructed_df[binary_cols_to_threshold] = reconstructed_df[binary_cols_to_threshold].astype(bool)
+
+
     return reconstructed_df
-    
+
 
 def convert_to_nan_based_on_dependencies(reconstructed_df):
     """
     Applies a dependency mask and NaN conversion to a DataFrame.
-    This includes creating a dictionary to track dependent columns that can contain NaN values, 
+    This includes creating a dictionary to track dependent columns that can contain NaN values,
     and applying NaN conversion based on it.
-
-    Parameters:
-    -----------
-    reconstructed_df : pd.DataFrame
-        The DataFrame containing the predictions that need to be masked and potentially converted to NaN.
-        
-    col_list_dict : dict
-        A dictionary containing information about the original columns. The 'original_cols' key should 
-        contain the list of columns that the dependency mask will be applied to.
-
-    Returns:
-    - Modified DataFrame with NaN values in dependent columns where independent columns are 0.
-   
     """
 
     # Create a dictionary to track dependent columns that may contain NaN values
@@ -656,16 +710,16 @@ def convert_to_nan_based_on_dependencies(reconstructed_df):
     # Iterate over the independent-dependent column mappings in masked_dict
     for ind_col, dep_cols in masked_dict.items():
         reconstructed_df.loc[reconstructed_df[ind_col] == 0, dep_cols] = np.nan
-    
+
     return reconstructed_df
 
 
 def add_eir_suid_to_predictions(reconstructed_df, test_eir_suid, col_list_dict):
     """
-    Adds 'eir' and 'suid' columns back to the masked_predictions DataFrame 
+    Adds 'eir' and 'suid' columns back to the masked_predictions DataFrame
     and reconstructs the full DataFrame with appropriate column names.
     """
-    
+
     reconstructed_cols_list = ['eir', 'suid'] + col_list_dict["original_cols"].tolist()
     post_processed_df = pd.concat([test_eir_suid.reset_index(drop=True), reconstructed_df], axis=1)
     post_processed_df.columns = reconstructed_cols_list #Assign the reconstructed column names
@@ -674,37 +728,37 @@ def add_eir_suid_to_predictions(reconstructed_df, test_eir_suid, col_list_dict):
 
 def post_process_predictions(x_hat_binary, x_hat_real, scaler, col_list_dict, test_eir_suid):
     """
-    Post-processes the model output by reversing normalization, rounding binary values, 
-    adding degenerate columns and reverting to original column ordering, 
-    applying a dependency mask for NaN conversion of some values, and adding the columns 
+    Post-processes the model output by reversing normalization, rounding binary values,
+    adding degenerate columns and reverting to original column ordering,
+    applying a dependency mask for NaN conversion of some values, and adding the columns
     eir, suid back as the first 2 columns.
-    
+
     Parameters:
     -----------
     x_hat_binary : numpy.ndarray
         The predicted binary values from the model output.
-        
+
     x_hat_real : numpy.ndarray
         The predicted real values from the model output.
-        
+
     scaler : object
         The scaler used for normalization, to reverse the normalization process.
-        
+
     col_list_dict : dict
         A dictionary containing column information including original columns and degenerate columns.
-    
+
     test_eir_suid : pd.DataFrame
-        A DataFrame containing the 'eir' and 'suid' columns. These columns serve as 
-        identifiers for the test data and will be added back to the predictions.
+        A DataFrame containing the 'eir' and 'suid' columns. These columns serve as
+        identifiers for the data and will be added back to the predictions.
 
     Returns:
     --------
     numpy.ndarray
         The final post-processed predictions, including NaN conversions where appropriate.
     """
-    
+
     # STEP 1: Reverse the normalization
-    denorm_df = reverse_normalization(x_hat_binary, x_hat_real, scaler)
+    denorm_df = reverse_normalization(x_hat_binary, x_hat_real, scaler, col_list_dict)
 
     # STEP 2: Put back the degenerate columns
     reconstructed_df = insert_degenerate_columns(denorm_df, col_list_dict, scaler)
@@ -712,28 +766,10 @@ def post_process_predictions(x_hat_binary, x_hat_real, scaler, col_list_dict, te
     # Step 3: Convert binary values to 0s and 1s
     reconstructed_df_with_bin_threshold = threshold_binary_columns(col_list_dict, reconstructed_df)
 
-
-    if __debug__:
-        # TESTING: Print a dependent column's values after inserting degenerate columns
-        # This is done to check the values of the columns before and after applying the NaN conversion
-        if 'infection_1_m_IRBCtimer' in reconstructed_df.columns:
-            print(f"TESTING:Values for 'infection_1_m_IRBCtimer' before applying NaN:\n{reconstructed_df['infection_1_m_IRBCtimer']}")
-
-
     # STEP 4: Apply NaN conversion
     reconstructed_df = convert_to_nan_based_on_dependencies(reconstructed_df_with_bin_threshold)
-         
-    if __debug__:
-        # TESTING: Print the column values after applying NaN conversion
-        if 'infection_1_m_IRBCtimer' in reconstructed_df.columns:
-            print(f"TESTING:Values for 'infection_1_m_IRBCtimer' after NaN conversion:\n{reconstructed_df['infection_1_m_IRBCtimer']}")
-        
-        # TESTING: Print the NaN stats after applying the conversion
-        print_nan_stats(reconstructed_df, col_list_dict)
-
 
     # STEP 5: Add the eir and suid back to the data
     final_predictions_df = add_eir_suid_to_predictions(reconstructed_df, test_eir_suid, col_list_dict)
 
     return final_predictions_df
-

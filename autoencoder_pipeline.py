@@ -1,6 +1,7 @@
+# Autoencoder
+
 import os, sys
 import numpy as np
-import matplotlib
 import matplotlib.pyplot as plt
 import pandas as pd
 import wandb
@@ -12,15 +13,18 @@ from torch.optim.lr_scheduler import LambdaLR
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from sklearn.metrics import roc_auc_score
-from utils.data_utils import *
 from pdb import set_trace as bp
+import json
 
-from utils.create_maskings import *
+# Check if running in Google Colab
+in_colab = "google.colab" in sys.modules or "COLAB_RELEASE_TAG" in os.environ
 
-matplotlib.use("Agg")  # Use a non-interactive backend for Matplotlib
+if not in_colab:
+    from utils.data_utils import *
+
 
 class ResidualAutoencoder(pl.LightningModule):
-    def __init__(self, input_dim, latent_dim, hidden_dims, activation_fn, use_residual, 
+    def __init__(self, input_dim, latent_dim, hidden_dims, activation_fn, use_residual,
                  identity_if_no_compression=False, use_batch_norm=False, use_layer_norm=False,
                  real_weight=1.0,
                  binary_weight=1.0,
@@ -33,15 +37,13 @@ class ResidualAutoencoder(pl.LightningModule):
                  **kwargs):
         super(ResidualAutoencoder, self).__init__()
 
-        self.test_outputs = []  # List to store test outputs per batch
-
         # print the kwargs and point out that they will be ignored
         print(f"kwargs: {kwargs}")
         print("Note: The kwargs will be ignored in this model, but were hopefully used elsewhere.")
 
         # set activation function if it is a string
         if isinstance(activation_fn, str):
-            activation_fn = getattr(nn, activation_fn)
+             activation_fn = getattr(nn, activation_fn)
 
         self.log_plot_freq = log_plot_freq # how often to make plots and log them to wandb
         self.log_plots = log_plots
@@ -57,6 +59,11 @@ class ResidualAutoencoder(pl.LightningModule):
         self.dropout_rate = dropout_rate
         self.real_weight = real_weight
         self.binary_weight = binary_weight
+
+        self.test_outputs = []
+        self.aggregated_test_results = {}
+
+
         # recommend to rescale MSE_loss to be of similar magnitude to BCE_loss
         # e.g. mse_loss_weight = 8.32 allows losses to be equal
         # also need to account for the number of features in each group
@@ -183,7 +190,9 @@ class ResidualAutoencoder(pl.LightningModule):
             # log binary images
             self.log_images_to_wandb(x_binary, x_hat_binary, x_real, x_hat_real, mask_binary, mask_real, 'train')
 
+
         return loss
+
 
     def validation_step(self, batch, batch_idx):
         x_binary, x_real, mask_binary, mask_real = batch
@@ -197,6 +206,8 @@ class ResidualAutoencoder(pl.LightningModule):
         if (self.current_epoch % self.log_plot_freq == 0 and batch_idx == 0):
             # log binary images
             self.log_images_to_wandb(x_binary, x_hat_binary, x_real, x_hat_real, mask_binary, mask_real, 'val')
+
+
 
     def test_step(self, batch, batch_idx):
         x_binary, x_real, mask_binary, mask_real = batch
@@ -221,9 +232,8 @@ class ResidualAutoencoder(pl.LightningModule):
             'x_hat_binary': x_hat_binary,
             'x_hat_real': x_hat_real
         }
-        self.test_outputs.append(output)   
-   
- 
+        self.test_outputs.append(output)
+
     def on_test_epoch_end(self):
         # Aggregate the predictions and masks from each batch
         all_x_hat_binary = torch.cat([output['x_hat_binary'] for output in self.test_outputs], dim=0)
@@ -237,13 +247,13 @@ class ResidualAutoencoder(pl.LightningModule):
 
         # Clear test outputs to free up memory
         self.test_outputs = []
-    
+
     def configure_optimizers(self):
         # Define optimizer
         optimizer = optim.Adam(self.parameters(), lr=self.learning_rate)
 
         # Define the number of warmup steps
-        num_warmup_steps = 50  # Adjust this based on your needs
+        num_warmup_steps = 250  # Can change this if required
 
         # Define the warmup schedule using LambdaLR
         def warmup_scheduler_lambda(current_step):
@@ -291,11 +301,11 @@ class ResidualAutoencoder(pl.LightningModule):
         # where lambda = 0.69 / 0.0833 = 8.32
 
         # Log losses to wandb
-        self.log(f"{stage}_weighted_mse_loss", weighted_mse_loss.item())
-        self.log(f"{stage}_weighted_bce_loss", weighted_bce_loss.item())
-        self.log(f"{stage}_mse_loss", mse_loss.item())
-        self.log(f"{stage}_bce_loss", bce_loss.item())
-        self.log(f"{stage}_loss", total_loss.item())
+        self.log(f"{stage}_weighted_mse_loss", weighted_mse_loss.item(), on_epoch=True)
+        self.log(f"{stage}_weighted_bce_loss", weighted_bce_loss.item(), on_epoch=True)
+        self.log(f"{stage}_mse_loss", mse_loss.item(), on_epoch=True)
+        self.log(f"{stage}_bce_loss", bce_loss.item(), on_epoch=True)
+        self.log(f"{stage}_loss", total_loss.item(), on_epoch=True)
 
         # compute AUROC for binary columns
         # Compute AUROC only on valid data (non-missing values where mask == 1)
@@ -305,7 +315,6 @@ class ResidualAutoencoder(pl.LightningModule):
         )  # No need for additional sigmoid
         mask_binary_cpu = mask_binary.detach().cpu().numpy()
 
-        # try:
         # Compute AUROC for each binary variable (mask out missing values)
         auroc_per_label = [
             roc_auc_score(
@@ -366,7 +375,7 @@ class ResidualAutoencoder(pl.LightningModule):
         """
         Create imshow-style plots of the true x_binary and x_real vs reconstructed x_hat_binary and x_hat_real,
         with the mask applied as black color. Log them as a single figure to wandb.
-        
+
         Args:
             x_binary (torch.Tensor): The true binary data.
             x_hat_binary (torch.Tensor): The reconstructed binary data.
@@ -472,21 +481,20 @@ def train_model(model, train_loader, val_loader, test_loader, config):
         config["accelerator"] = "gpu"
     else:
         config["accelerator"] = "cpu"
-        config["devices"] = 1
 
     output_dir = "outputs"
     os.makedirs(f"{output_dir}", exist_ok=True)
 
-    wandb_logger = WandbLogger(project="autoencoder_project", save_dir=output_dir)
+    wandb_logger = WandbLogger(project="ae_project", save_dir=output_dir)
 
     # Log the hyperparameters to wandb
     wandb_logger.experiment.config.update(config)
 
     trainer = pl.Trainer(
         logger=wandb_logger,
-        log_every_n_steps=10,
+        log_every_n_steps=20, #Can modify this
         max_epochs=model.max_epochs,
-        # gradient_clip_val=0.5,
+        gradient_clip_val=config["gradient_clip_val"],
         callbacks=[
             pl.callbacks.LearningRateMonitor(logging_interval="step"),  # was "epoch"
             pl.callbacks.EarlyStopping(monitor="val_loss", patience=config["early_stopping_patience"]),
@@ -499,34 +507,94 @@ def train_model(model, train_loader, val_loader, test_loader, config):
             ),
         ],
         accelerator=config["accelerator"],  # mps, gpu, cpu
-        devices=config["devices"], # if this is "1" uses 1 device, "-1" uses all available devices,
-        # if it is a list, it uses the devices in the list
+        # can configure devices= if desired to choose specific GPUs
     )
     trainer.fit(model, train_loader, val_loader)
 
-    
     # Test the model on the test set
     trainer.test(model, test_loader)
 
 
+#Uncomment this if you do not want to run as WandB sweep
 # 5. Main function to run the script
 if __name__ == "__main__":
+
+    #Can later modify to use the argparser if needed
 
     # preliminary setup
     batch_size = 2048 # setting to None uses full dataset
     shuffle_train = True
+    max_epochs = 1
+    latent_dim = 500
+    save_predictions = True
+    test_only = False
+    identity_run = False
+    subset_data_30 = True
+    subset_data_1_percent = False
 
-    # Prepare data
-    # use 1% data subset
-    filename = "data/combined_data_subset_1_percent.csv"
+    # Check if running in Google Colab
+    in_colab = "google.colab" in sys.modules or "COLAB_RELEASE_TAG" in os.environ
 
-    # use 10% data subset
-    # filename = "data/combined_data_subset_10_percent.csv"
+    if in_colab:
+        base_dir = "/content/drive/MyDrive/Research_Levine/diffusion_notebooks"
+    else:
+        base_dir = "data" #running locally
 
-    # use full data
-    # filename = "data/combined_data.csv"
 
-    train_loader, val_loader, test_loader, scaler, col_list_dict, test_eir_suid = prepare_data(filename, batch_size, shuffle_train)
+    #setup input and output directories and filenames
+    input_dir = f"{base_dir}/Inputs"
+    test_dataset_raw_dir= None
+
+
+    if subset_data_30:
+        input_file = f"{input_dir}/combined_data_subset_30_rows.csv"
+        output_file_postfix = "input_30_rows"
+    elif subset_data_1_percent:
+        input_file = f"{input_dir}/combined_data_subset_1_percent.csv"
+        output_file_postfix = "input_1_percent_rows"
+    else:
+        input_file = f"{input_dir}/combined_data.csv"
+        output_file_postfix = "input_all_rows"
+
+    output_dir = f"{base_dir}/Output/predictions"
+
+    #Store information to be used for running tests to analyze the model performance
+    evaluation_metadata_filename = f"{output_dir}/evaluation_metadata.json"
+
+    if test_only:
+        output_test_dataset_dir = f"{output_dir}/test_dataset"
+        test_dataset_raw_dir= f"{input_dir}/generated_test_data"
+        if identity_run:
+            output_file = f"{output_test_dataset_dir}/identity/predicted_test_dataset_identity_case_{latent_dim}_latent_dim_{output_file_postfix}.csv"
+        else:
+            output_file = f"{output_test_dataset_dir}/{latent_dim}/predicted_test_dataset_{latent_dim}_latent_dim_{output_file_postfix}.csv"
+    else:
+        output_full_dataset_dir = f"{output_dir}/full_dataset"
+        if identity_run:
+            output_file = f"{output_full_dataset_dir}/identity/predicted_full_dataset_identity_case_{latent_dim}_latent_dim_{output_file_postfix}.csv"
+        else:
+            output_file = f"{output_full_dataset_dir}/{latent_dim}/predicted_full_dataset_{latent_dim}_latent_dim_{output_file_postfix}.csv"
+
+    print("batch_size:", batch_size)
+    print("shuffle_train:", shuffle_train)
+    print("max_epochs:", max_epochs)
+    print("latent_dim:", latent_dim)
+    print("save_predictions:", save_predictions)
+    print("test_only:", test_only)
+    print("identity_run:", identity_run)
+    print("subset_data_30:", subset_data_30)
+    print("subset_data_1_percent:", subset_data_1_percent)
+    print("Input file path:", input_file)
+    print("Output file path:", output_file)
+
+    train_loader, val_loader, test_loader, scaler, col_list_dict, test_eir_suid, full_loader, all_eir_suid = prepare_data(
+        input_file,
+        batch_size,
+        shuffle_train,
+        test_dataset_predictions=test_only,
+        test_dataset_raw_dir=test_dataset_raw_dir,
+        input_type=output_file_postfix
+    )
 
     # determine MSE vs BCE loss weights by counting number of features (and possibly doing further re-weighting)
     num_binary_features = train_loader.dataset.dataset.binary_data.shape[1]
@@ -546,30 +614,46 @@ if __name__ == "__main__":
 
     # total_loss = real_weight * MSE_loss + binary_weight * BCE_loss
 
-    # Define configuration for wandb
+    # Define configuration
+    # Base configuration with common values
     config = {
-        "filename": filename,
+        "filename": input_file,
         "input_dim": num_total_features,
-        "latent_dim": 1000,
-        "hidden_dims": [2000, 1500],
-        "activation_fn": nn.GELU,
+        "activation_fn": nn.PReLU,
         "use_residual": True,
-        "identity_if_no_compression": False,
         "use_batch_norm": True,
         "use_layer_norm": False,
         "learning_rate": 1e-4,
         "dropout_rate": 0.0,
         "batch_size": batch_size,  # None uses full dataset
         "shuffle_train": shuffle_train,
-        "max_epochs": 30,
+        "max_epochs": 1,
         "real_weight": real_weight,
         "binary_weight": binary_weight,
         "log_plot_freq": 20,
+        "gradient_clip_val": 0,
         "log_plots": True,
         "log_grads": False,
-        "early_stopping_patience": 20,
-        "devices": [0],  # Use the first device
+        "early_stopping_patience": 10,
+        "devices": [0]  # Use the first device
     }
+
+    print(config)
+
+    # Update specific values based on identity_run
+    if identity_run:
+        config.update({
+            "latent_dim": num_total_features,
+            "hidden_dims": [num_total_features],
+            "identity_if_no_compression": True
+        })
+    else:
+        config.update({
+            "latent_dim": latent_dim,
+            "hidden_dims": [12000, 8000, 4000, 2000, 1000],
+            "identity_if_no_compression": False
+        })
+
 
     # Initialize model
     model = ResidualAutoencoder(**config)
@@ -577,19 +661,74 @@ if __name__ == "__main__":
     # Train model
     train_model(model, train_loader, val_loader, test_loader, config)
 
-    # Access the test results from the model after testing
-    x_hat_binary = model.aggregated_test_results['x_hat_binary']
-    x_hat_real = model.aggregated_test_results['x_hat_real']
+    model.eval()  # Set the model to evaluation mode
 
-    # Post process the output
-    final_predictions_df = post_process_predictions(x_hat_binary, x_hat_real, scaler, col_list_dict, test_eir_suid)
+    if test_only:
 
-    # Write final predictions to CSV
-    final_predictions_df.to_csv('predictions.csv', columns=final_predictions_df.columns, index=False)
+      # Predict on test data
+      print("Predicting test data")
+
+      #Generate predictions from the model's test results
+      x_hat_binary = model.aggregated_test_results['x_hat_binary']
+      x_hat_real = model.aggregated_test_results['x_hat_real']
+
+      # Post-process the predictions
+      final_predictions_df = post_process_predictions(
+          x_hat_binary,
+          x_hat_real,
+          scaler,
+          col_list_dict,
+          test_eir_suid)
+
+      if save_predictions:
+          # Save the final post-processed predictions as a CSV file
+          final_predictions_df.to_csv(f'{output_file}', index=False)
+
+    else:
+
+        # Predict on full data Rick Final
+        print("Predicting full data")
+        all_binary_preds, all_real_preds = [], []
+        with torch.no_grad():
+            for batch in full_loader:
+                x_binary, x_real, _, _ = batch  # Unpack batch to get binary and real components
+                binary_pred, real_pred = model(x_binary, x_real)
+                all_binary_preds.append(binary_pred)
+                all_real_preds.append(real_pred)
+
+        all_binary_preds = torch.cat(all_binary_preds, dim=0)
+        all_real_preds = torch.cat(all_real_preds, dim=0)
+
+        # Process predictions
+        final_predictions_df = post_process_predictions(
+            all_binary_preds,
+            all_real_preds,
+            scaler,
+            col_list_dict,
+            all_eir_suid
+        )
+
+        if save_predictions:
+            # Save the final post-processed predictions as a CSV file
+            final_predictions_df.to_csv(f'{output_file}', index=False)
+
+
+    # Code to save col_list_dict to a JSON file so that we can access it later in tests
+    subset_col_list_dict = {
+        "degenerate_cols": list(col_list_dict["degenerate_cols"].keys()),
+        "binary_cols": col_list_dict["binary_cols"],
+        "real_cols": col_list_dict["real_cols"],
+        "original_cols": col_list_dict["original_cols"].tolist(),
+        "integer_encoded_binary_cols":col_list_dict["integer_encoded_binary_cols"]
+    }
+    # Write to JSON file
+    with open(evaluation_metadata_filename, "w") as f:
+        json.dump(subset_col_list_dict, f)
+
 
     '''
     NOTE:
-    With latent_dim==input_dim and GELU activation, we are able to get VERY close to identity mapping.
+    With latent_dim==input_dim and PReLU/GELU activation, we are able to get VERY close to identity mapping.
     A few comments:
         1. We are using residual connections (Projection based) and batch norm; can try without these.
         2. Needed to run for MANY epochs (set to 1000).
